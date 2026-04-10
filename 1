@@ -1,0 +1,602 @@
+from flask import Flask, jsonify, request, render_template_string
+from urllib.parse import unquote
+import requests
+from bs4 import BeautifulSoup
+import re
+
+app = Flask(__name__)
+
+BASE = "https://asd.pics"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36",
+    "Referer": "https://asd.pics/",
+    "X-Requested-With": "XMLHttpRequest",
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "Origin": "https://asd.pics"
+}
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
+
+CATEGORIES = {
+    "movies":         "/category/foreign-movies-12/",
+    "arabic_movies":  "/category/arabic-movies-10/",
+    "series":         "/category/foreign-series-5/",
+    "arabic_series":  "/category/arabic-series-8/",
+    "turkish_series": "/category/turkish-series-2/",
+    "anime":          "/category/cartoon-series/",
+    "ramadan":        "/category/%d9%85%d8%b3%d9%84%d8%b3%d9%84%d8%a7%d8%aa-%d8%b1%d9%85%d8%b6%d8%a7%d9%86/ramadan-series-2026/",
+}
+
+# ===========================
+# === استخراج روابط مباشرة ==
+# ===========================
+
+def extract_from_vidara(embed_url):
+    """vidara.to - يستخدم /api/stream?filecode=xxx"""
+    try:
+        filecode = embed_url.rstrip("/").split("/")[-1]
+        api_url  = f"https://vidara.to/api/stream?filecode={filecode}"
+        r = SESSION.get(api_url, headers={
+            "User-Agent": HEADERS["User-Agent"],
+            "Referer": embed_url
+        }, timeout=10)
+        data = r.json()
+        streaming_url = data.get("streaming_url", "")
+        return {
+            "url":   streaming_url,
+            "type":  "m3u8" if ".m3u8" in streaming_url else "mp4",
+            "title": data.get("title", ""),
+            "thumb": data.get("thumbnail", "")
+        }
+    except:
+        return {}
+
+def extract_from_vidmoly(embed_url):
+    """vidmoly.net - M3U8 مباشر في HTML"""
+    try:
+        r = SESSION.get(embed_url, headers={
+            "User-Agent": HEADERS["User-Agent"],
+            "Referer": "https://asd.pics/"
+        }, timeout=10)
+        m3u8 = re.findall(r'https?://[^\s"\'\\<>]+\.m3u8[^\s"\'\\<>]*', r.text)
+        mp4  = re.findall(r'https?://[^\s"\'\\<>]+\.mp4[^\s"\'\\<>]*',  r.text)
+        url  = m3u8[0] if m3u8 else (mp4[0] if mp4 else "")
+        return {
+            "url":  url,
+            "type": "m3u8" if m3u8 else "mp4"
+        }
+    except:
+        return {}
+
+def extract_from_voe(embed_url):
+    """voe.sx - يعمل redirect ثم نستخرج منه"""
+    try:
+        filecode   = embed_url.rstrip("/").split("/")[-1]
+        redirect   = f"https://lancewhosedifficult.com/e/{filecode}"
+        r = SESSION.get(redirect, headers={
+            "User-Agent": HEADERS["User-Agent"],
+            "Referer": "https://asd.pics/"
+        }, timeout=10, allow_redirects=True)
+        m3u8 = re.findall(r'https?://[^\s"\'\\<>]+\.m3u8[^\s"\'\\<>]*', r.text)
+        mp4  = re.findall(r'https?://[^\s"\'\\<>]+\.mp4[^\s"\'\\<>]*',  r.text)
+        # بحث في JS
+        sources = re.findall(r'"(?:file|src|url)"\s*:\s*"([^"]+)"', r.text)
+        for s in sources:
+            if ".m3u8" in s: m3u8.append(s)
+            if ".mp4"  in s: mp4.append(s)
+        url = m3u8[0] if m3u8 else (mp4[0] if mp4 else "")
+        return {
+            "url":  url,
+            "type": "m3u8" if m3u8 else "mp4"
+        }
+    except:
+        return {}
+
+def extract_direct_url(embed_url):
+    """يختار الدالة المناسبة حسب الموقع"""
+    if not embed_url:
+        return {}
+    if "vidara" in embed_url:
+        return extract_from_vidara(embed_url)
+    if "vidmoly" in embed_url:
+        return extract_from_vidmoly(embed_url)
+    if "voe.sx" in embed_url or "lancewhosedifficult" in embed_url:
+        return extract_from_voe(embed_url)
+    # محاولة عامة لأي موقع آخر
+    try:
+        r = SESSION.get(embed_url, headers={
+            "User-Agent": HEADERS["User-Agent"],
+            "Referer": "https://asd.pics/"
+        }, timeout=10, allow_redirects=True)
+        m3u8 = re.findall(r'https?://[^\s"\'\\<>]+\.m3u8[^\s"\'\\<>]*', r.text)
+        mp4  = re.findall(r'https?://[^\s"\'\\<>]+\.mp4[^\s"\'\\<>]*',  r.text)
+        url  = m3u8[0] if m3u8 else (mp4[0] if mp4 else "")
+        return {"url": url, "type": "m3u8" if m3u8 else "mp4"}
+    except:
+        return {}
+
+# ===========================
+# ======= Helper Funcs ======
+# ===========================
+
+def get_page(url):
+    try:
+        url = unquote(url)
+        r   = SESSION.get(url, timeout=15, allow_redirects=True)
+        return r if r.status_code == 200 else None
+    except:
+        return None
+
+def extract_meta(html_text):
+    csrf   = re.search(r"csrf__token['\"\s:]+['\"](\w+)['\"]", html_text)
+    postid = re.search(r"psot_id['\"\s:]+['\"](\d+)['\"]", html_text)
+    return (
+        csrf.group(1)   if csrf   else "",
+        postid.group(1) if postid else ""
+    )
+
+def get_watch_server(post_id, quality, server, csrf_token):
+    try:
+        r    = SESSION.post(f"{BASE}/get__watch__server/", data={
+            "post_id":    post_id,
+            "quality":    quality,
+            "server":     server,
+            "csrf_token": csrf_token
+        }, timeout=10)
+        data = r.json()
+        if data.get("type") == "success":
+            data["iframe_src"] = data.get("server", "")
+        return data
+    except:
+        return {}
+
+def get_servers(post_id, csrf_token):
+    available = []
+    for quality in ["1080", "720", "480"]:
+        try:
+            r    = SESSION.post(f"{BASE}/get__watch__server/", data={
+                "post_id":    post_id,
+                "quality":    quality,
+                "server":     "1",
+                "csrf_token": csrf_token
+            }, timeout=8)
+            data = r.json()
+            if data.get("type") == "success" and data.get("server"):
+                available.append({"label": f"🎬 {quality}p", "value": quality})
+        except:
+            pass
+    return {"qualities": available}
+
+def parse_content_list(html_text):
+    soup = BeautifulSoup(html_text, "html.parser")
+    results, seen = [], set()
+    skip = [
+        "/category/", "/page/", "/movies/", "/series/",
+        "/recently/", "/trend/", "/find/", "/main", "/home",
+        "/privacy", "/dmca", "/orders", "/wp-", "/سيرفر",
+        "/selary/", "/the-bluff/", "/whistle/"
+    ]
+    for a in soup.find_all("a", href=True):
+        href = unquote(a["href"])
+        if BASE not in href: continue
+        if href in seen: continue
+        if any(s in href for s in skip): continue
+        img    = a.find("img")
+        poster = (img.get("data-src") or img.get("src") or "") if img else ""
+        title  = a.get_text(separator=" ", strip=True)[:80]
+        if title and len(title) > 2:
+            seen.add(href)
+            results.append({"title": title, "url": href, "poster": poster})
+    return results
+
+# ===========================
+# ========== HTML ===========
+# ===========================
+
+HTML = """<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>عرب سيد</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:system-ui,Arial,sans-serif;background:#0b0d13;color:#eee;min-height:100vh}
+  header{background:#161926;padding:12px 16px;display:flex;align-items:center;gap:10px;border-bottom:2px solid #e50914;position:sticky;top:0;z-index:100}
+  header h1{font-size:18px;color:#fff;white-space:nowrap}
+  header h1 span{color:#e50914}
+  .search-bar{display:flex;flex:1;max-width:500px;margin:0 auto}
+  .search-bar input{flex:1;padding:8px 12px;background:#0b0d13;border:1px solid #333;border-radius:8px 0 0 8px;color:#fff;font-size:14px;outline:none}
+  .search-bar button{padding:8px 14px;background:#e50914;border:none;border-radius:0 8px 8px 0;color:#fff;cursor:pointer;font-size:14px}
+  .tabs{display:flex;gap:8px;padding:12px 14px;overflow-x:auto;background:#111318;border-bottom:1px solid #222}
+  .tabs::-webkit-scrollbar{height:3px}
+  .tabs::-webkit-scrollbar-thumb{background:#e50914;border-radius:4px}
+  .tab{padding:6px 14px;border-radius:20px;border:1px solid #333;background:transparent;color:#aaa;cursor:pointer;white-space:nowrap;font-size:13px;transition:all .2s}
+  .tab.active,.tab:hover{background:#e50914;color:#fff;border-color:#e50914}
+  .container{padding:14px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:12px}
+  .card{background:#161926;border-radius:10px;overflow:hidden;cursor:pointer;transition:transform .2s;border:1px solid #222}
+  .card:hover{transform:scale(1.04)}
+  .card img{width:100%;aspect-ratio:2/3;object-fit:cover;background:#222;display:block}
+  .card-info{padding:7px}
+  .card-title{font-size:11px;color:#ddd;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.4}
+  .loader{display:none;text-align:center;padding:40px;color:#e50914;font-size:30px}
+  .loader.show{display:block}
+  .modal-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.88);z-index:200;align-items:center;justify-content:center;padding:12px}
+  .modal-bg.show{display:flex}
+  .modal{background:#161926;border-radius:14px;width:100%;max-width:720px;max-height:92vh;overflow-y:auto;padding:18px;position:relative}
+  .modal-close{position:absolute;top:10px;left:10px;background:#e50914;border:none;color:#fff;width:30px;height:30px;border-radius:50%;font-size:16px;cursor:pointer;line-height:30px;text-align:center}
+  .modal h2{font-size:15px;margin-bottom:12px;padding-left:38px;color:#fff}
+  .player-box{width:100%;aspect-ratio:16/9;background:#000;border-radius:10px;overflow:hidden;margin-bottom:14px;position:relative}
+  .player-box video{width:100%;height:100%;outline:none}
+  .player-box .no-video{display:flex;align-items:center;justify-content:center;height:100%;color:#555;font-size:14px}
+  .section-title{font-size:12px;color:#888;margin-bottom:8px;margin-top:10px}
+  .btns-row{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:6px}
+  .srv-btn{padding:7px 16px;border-radius:8px;border:1px solid #333;background:#0b0d13;color:#ccc;cursor:pointer;font-size:13px;transition:all .2s}
+  .srv-btn:hover,.srv-btn.active{background:#e50914;color:#fff;border-color:#e50914}
+  .direct-link{background:#0b0d13;border:1px solid #2a2a2a;border-radius:8px;padding:10px;font-size:11px;word-break:break-all;color:#4af;margin-top:10px;display:none}
+  .copy-btn{padding:5px 12px;background:#1a2a1a;border:1px solid #2a4a2a;border-radius:6px;color:#4f4;cursor:pointer;font-size:12px;margin-top:6px;display:none}
+  .copy-btn:hover{background:#2a4a2a}
+  .msg{text-align:center;padding:30px;color:#555;font-size:14px}
+  .load-more{display:block;margin:18px auto;padding:11px 30px;background:#e50914;color:#fff;border:none;border-radius:10px;font-size:14px;cursor:pointer}
+  .load-more:disabled{background:#444;cursor:default}
+  .spinner{display:inline-block;width:14px;height:14px;border:2px solid #555;border-top-color:#e50914;border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle;margin-right:6px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  @media(max-width:480px){.grid{grid-template-columns:repeat(auto-fill,minmax(105px,1fr))}}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>عرب<span>سيد</span></h1>
+  <div class="search-bar">
+    <input type="text" id="searchInput" placeholder="ابحث عن فيلم أو مسلسل...">
+    <button onclick="doSearch()">🔍</button>
+  </div>
+</header>
+
+<div class="tabs">
+  <button class="tab active" onclick="loadCat('movies',this)">🎬 أفلام أجنبي</button>
+  <button class="tab" onclick="loadCat('arabic_movies',this)">🎭 أفلام عربي</button>
+  <button class="tab" onclick="loadCat('series',this)">📺 مسلسلات أجنبي</button>
+  <button class="tab" onclick="loadCat('arabic_series',this)">📺 مسلسلات عربي</button>
+  <button class="tab" onclick="loadCat('turkish_series',this)">🌙 مسلسلات تركية</button>
+  <button class="tab" onclick="loadCat('anime',this)">⛩️ أنمي</button>
+  <button class="tab" onclick="loadCat('ramadan',this)">🌙 رمضان 2026</button>
+</div>
+
+<div class="container">
+  <div class="loader" id="loader">⏳</div>
+  <div class="grid" id="grid"></div>
+  <div class="msg" id="msg"></div>
+  <button class="load-more" id="loadMoreBtn" onclick="loadMore()" style="display:none">تحميل المزيد</button>
+</div>
+
+<div class="modal-bg" id="modalBg" onclick="bgClick(event)">
+  <div class="modal">
+    <button class="modal-close" onclick="closeModal()">✕</button>
+    <h2 id="modalTitle">جاري التحميل...</h2>
+
+    <div class="player-box" id="playerBox">
+      <div class="no-video" id="noVideo">اختر جودة وسيرفر للتشغيل</div>
+      <video id="videoPlayer" controls style="display:none"
+             playsinline preload="metadata">
+      </video>
+    </div>
+
+    <p class="section-title">🎚️ الجودة</p>
+    <div class="btns-row" id="qualityBtns"></div>
+
+    <p class="section-title">📡 السيرفرات</p>
+    <div class="btns-row" id="serverBtns"></div>
+
+    <div class="direct-link" id="directLink"></div>
+    <button class="copy-btn" id="copyBtn" onclick="copyLink()">📋 نسخ الرابط</button>
+  </div>
+</div>
+
+<script>
+let curPage=1, curType="movies", curUrl="", busy=false;
+let currentDirectUrl="";
+
+async function loadCat(type,btn){
+  document.querySelectorAll(".tab").forEach(t=>t.classList.remove("active"));
+  btn.classList.add("active");
+  curType=type; curPage=1;
+  document.getElementById("grid").innerHTML="";
+  document.getElementById("msg").textContent="";
+  document.getElementById("loadMoreBtn").style.display="none";
+  await fetchList(type,1,false);
+}
+
+async function fetchList(type,page,append){
+  setLoader(true);
+  try{
+    const r=await fetch(`/list?type=${type}&page=${page}`);
+    const d=await r.json();
+    renderCards(d.results,append);
+    document.getElementById("loadMoreBtn").style.display=d.count>0?"block":"none";
+    if(!d.count&&!append) document.getElementById("msg").textContent="لا توجد نتائج";
+  }catch(e){
+    document.getElementById("msg").textContent="❌ خطأ في الاتصال";
+  }
+  setLoader(false);
+}
+
+async function loadMore(){
+  if(busy)return;
+  busy=true; curPage++;
+  await fetchList(curType,curPage,true);
+  busy=false;
+}
+
+document.getElementById("searchInput").addEventListener("keydown",e=>{
+  if(e.key==="Enter") doSearch();
+});
+
+async function doSearch(){
+  const q=document.getElementById("searchInput").value.trim();
+  if(!q)return;
+  document.getElementById("grid").innerHTML="";
+  document.getElementById("msg").textContent="";
+  document.getElementById("loadMoreBtn").style.display="none";
+  document.querySelectorAll(".tab").forEach(t=>t.classList.remove("active"));
+  setLoader(true);
+  try{
+    const r=await fetch(`/search?q=${encodeURIComponent(q)}`);
+    const d=await r.json();
+    renderCards(d.results,false);
+    if(!d.count) document.getElementById("msg").textContent="لا توجد نتائج";
+  }catch(e){
+    document.getElementById("msg").textContent="❌ خطأ في الاتصال";
+  }
+  setLoader(false);
+}
+
+function renderCards(items,append){
+  const grid=document.getElementById("grid");
+  if(!append) grid.innerHTML="";
+  if(!items||!items.length)return;
+  const noImg="https://asd.pics/wp-content/themes/ArabSeed/assets/img/no-image.jpg";
+  items.forEach(item=>{
+    const d=document.createElement("div");
+    d.className="card";
+    d.innerHTML=`
+      <img src="${item.poster||noImg}"
+           onerror="this.src='${noImg}'" loading="lazy" alt="">
+      <div class="card-info"><div class="card-title">${item.title}</div></div>`;
+    d.onclick=()=>openVideo(item.url,item.title);
+    grid.appendChild(d);
+  });
+}
+
+async function openVideo(url,title){
+  curUrl=url;
+  document.getElementById("modalTitle").textContent=title||"...";
+  resetPlayer();
+  document.getElementById("qualityBtns").innerHTML=
+    `<span style='color:#aaa;font-size:12px'><span class='spinner'></span> جاري تحميل الجودات...</span>`;
+  document.getElementById("serverBtns").innerHTML="";
+  document.getElementById("modalBg").classList.add("show");
+
+  try{
+    const r=await fetch(`/video?url=${encodeURIComponent(url)}`);
+    const d=await r.json();
+    document.getElementById("qualityBtns").innerHTML="";
+    if(d.error){
+      document.getElementById("qualityBtns").innerHTML=
+        `<span style='color:#e50914'>${d.error}</span>`;
+      return;
+    }
+    const qualities=d.servers&&d.servers.qualities||[];
+    if(qualities.length){
+      qualities.forEach((q,i)=>{
+        const btn=makeBtn(q.label,i===0,async(e)=>{
+          document.querySelectorAll("#qualityBtns .srv-btn")
+            .forEach(b=>b.classList.remove("active"));
+          e.target.classList.add("active");
+          await loadServers(q.value);
+        });
+        document.getElementById("qualityBtns").appendChild(btn);
+      });
+      await loadServers(qualities[0].value);
+    } else {
+      document.getElementById("qualityBtns").innerHTML=
+        "<span style='color:#888;font-size:12px'>لا توجد جودات</span>";
+    }
+  }catch(e){
+    document.getElementById("qualityBtns").innerHTML=
+      "<span style='color:#e50914'>❌ خطأ</span>";
+  }
+}
+
+async function loadServers(quality){
+  const sBox=document.getElementById("serverBtns");
+  sBox.innerHTML=`<span style='color:#aaa;font-size:12px'><span class='spinner'></span> جاري استخراج الروابط...</span>`;
+  resetPlayer();
+
+  const results=[];
+  for(let sv=1;sv<=3;sv++){
+    try{
+      const r=await fetch(`/direct?url=${encodeURIComponent(curUrl)}&quality=${quality}&server=${sv}`);
+      const d=await r.json();
+      if(d.url){
+        results.push({
+          id:sv,
+          url:d.url,
+          type:d.type||"m3u8",
+          name:d.name||`سيرفر ${sv}`
+        });
+      }
+    }catch(e){}
+  }
+
+  sBox.innerHTML="";
+  if(!results.length){
+    sBox.innerHTML="<span style='color:#888;font-size:12px'>لا توجد روابط لهذه الجودة</span>";
+    return;
+  }
+
+  results.forEach((s,i)=>{
+    const btn=makeBtn(`${s.name} (${s.type.toUpperCase()})`,i===0,(e)=>{
+      document.querySelectorAll("#serverBtns .srv-btn")
+        .forEach(b=>b.classList.remove("active"));
+      e.target.classList.add("active");
+      playDirect(s.url,s.type);
+    });
+    sBox.appendChild(btn);
+  });
+
+  playDirect(results[0].url, results[0].type);
+}
+
+function playDirect(url,type){
+  if(!url)return;
+  currentDirectUrl=url;
+  const video=document.getElementById("videoPlayer");
+  const noVid=document.getElementById("noVideo");
+  const linkEl=document.getElementById("directLink");
+  const copyBtn=document.getElementById("copyBtn");
+
+  video.src=url;
+  video.style.display="block";
+  noVid.style.display="none";
+  video.play().catch(()=>{});
+
+  linkEl.textContent="🔗 "+url;
+  linkEl.style.display="block";
+  copyBtn.style.display="inline-block";
+}
+
+function resetPlayer(){
+  const video=document.getElementById("videoPlayer");
+  video.pause();
+  video.src="";
+  video.style.display="none";
+  document.getElementById("noVideo").style.display="flex";
+  document.getElementById("directLink").style.display="none";
+  document.getElementById("copyBtn").style.display="none";
+  currentDirectUrl="";
+}
+
+function copyLink(){
+  if(!currentDirectUrl)return;
+  navigator.clipboard.writeText(currentDirectUrl).then(()=>{
+    document.getElementById("copyBtn").textContent="✅ تم النسخ!";
+    setTimeout(()=>document.getElementById("copyBtn").textContent="📋 نسخ الرابط",2000);
+  });
+}
+
+function makeBtn(label,active,onclick){
+  const btn=document.createElement("button");
+  btn.className="srv-btn"+(active?" active":"");
+  btn.textContent=label;
+  btn.onclick=onclick;
+  return btn;
+}
+
+function bgClick(e){if(e.target.id==="modalBg")closeModal();}
+function closeModal(){
+  document.getElementById("modalBg").classList.remove("show");
+  resetPlayer();
+}
+function setLoader(v){
+  document.getElementById("loader").classList.toggle("show",v);
+}
+
+window.onload=()=>loadCat("movies",document.querySelector(".tab.active"));
+</script>
+</body>
+</html>"""
+
+# ===========================
+# ======== Routes ===========
+# ===========================
+
+@app.route("/")
+def home():
+    return render_template_string(HTML)
+
+@app.route("/list")
+def list_content():
+    ctype = request.args.get("type","movies")
+    page  = request.args.get("page",1,type=int)
+    path  = CATEGORIES.get(ctype, CATEGORIES["movies"])
+    url   = BASE + path + (f"page/{page}/" if page > 1 else "")
+    r     = get_page(url)
+    if not r:
+        return jsonify({"error":"فشل الاتصال","results":[],"count":0}),500
+    items = parse_content_list(r.text)
+    return jsonify({"type":ctype,"page":page,"count":len(items),"results":items})
+
+@app.route("/video")
+def get_video():
+    url = unquote(request.args.get("url",""))
+    if not url:
+        return jsonify({"error":"أرسل ?url=رابط"}),400
+    r = get_page(url)
+    if not r:
+        return jsonify({"error":"فشل الاتصال"}),500
+    csrf, post_id = extract_meta(r.text)
+    if not post_id:
+        return jsonify({"error":"لم يتم العثور على post_id"}),404
+    servers_data = get_servers(post_id, csrf)
+    return jsonify({"url":url,"post_id":post_id,"csrf":csrf,"servers":servers_data})
+
+@app.route("/direct")
+def get_direct():
+    """الـ endpoint الجديد - يرجع رابط مباشر بدون iframe"""
+    url     = unquote(request.args.get("url",""))
+    quality = request.args.get("quality","720")
+    server  = request.args.get("server","1")
+    if not url:
+        return jsonify({"error":"أرسل ?url=رابط"}),400
+    r = get_page(url)
+    if not r:
+        return jsonify({"error":"فشل الاتصال"}),500
+    csrf, post_id = extract_meta(r.text)
+    # جلب embed url
+    watch_data = get_watch_server(post_id, quality, server, csrf)
+    embed_url  = watch_data.get("iframe_src","")
+    if not embed_url:
+        return jsonify({"error":"لم يتم العثور على سيرفر"}),404
+    # استخراج الرابط المباشر
+    direct = extract_direct_url(embed_url)
+    # إضافة اسم السيرفر
+    for name in ["vidara","vidmoly","voe"]:
+        if name in embed_url:
+            direct["name"] = f"▶ {name}"
+            break
+    else:
+        direct["name"] = f"سيرفر {server}"
+    direct["embed"] = embed_url
+    return jsonify(direct)
+
+@app.route("/play")
+def play():
+    url     = unquote(request.args.get("url",""))
+    quality = request.args.get("quality","720")
+    server  = request.args.get("server","1")
+    if not url:
+        return jsonify({"error":"أرسل ?url=رابط"}),400
+    r = get_page(url)
+    if not r:
+        return jsonify({"error":"فشل الاتصال"}),500
+    csrf, post_id = extract_meta(r.text)
+    data = get_watch_server(post_id, quality, server, csrf)
+    return jsonify({"post_id":post_id,"quality":quality,"server":server,"result":data})
+
+@app.route("/search")
+def search():
+    q = request.args.get("q","")
+    if not q:
+        return jsonify({"error":"استخدم ?q=اسم الفيلم"}),400
+    url = f"{BASE}/?s={requests.utils.quote(q)}"
+    r   = get_page(url)
+    if not r:
+        return jsonify({"error":"فشل الاتصال"}),500
+    items = parse_content_list(r.text)
+    return jsonify({"query":q,"count":len(items),"results":items})
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
