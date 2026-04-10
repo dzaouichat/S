@@ -1,0 +1,481 @@
+pkill -f "python3" 2>/dev/null; sleep 1; python3 << 'EOF'
+from flask import Flask, request, jsonify, Response
+import requests, re
+from bs4 import BeautifulSoup
+
+app = Flask(__name__)
+
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept-Language': 'ar,en;q=0.9',
+    'Referer': 'https://topcinemaa.com/',
+}
+
+def get_img(tag):
+    if not tag: return ''
+    return tag.get('data-src','') or tag.get('src','') or ''
+
+def decode_eval(text):
+    s = text.find('eval(function(p,a,c,k,e,d)')
+    if s == -1: return ''
+    block = text[s:s+15000]
+    m = re.search(r"}\('(.+)',(\d+),(\d+),'(.+)'\.split\('\|'\)\)\)", block, re.S)
+    if not m: return ''
+    p,a,c,k = m.group(1),int(m.group(2)),int(m.group(3)),m.group(4)
+    kw = k.split('|')
+    def tb(n,b):
+        ch='0123456789abcdefghijklmnopqrstuvwxyz'
+        if n==0: return '0'
+        r=''
+        while n: r=ch[n%b]+r; n//=b
+        return r
+    res=p
+    for i in range(c-1,-1,-1):
+        key=tb(i,a)
+        if i<len(kw) and kw[i]:
+            res=re.sub(r'\b'+re.escape(key)+r'\b',kw[i],res)
+    return res
+
+def get_video_links(embed_url):
+    try:
+        h={'User-Agent':HEADERS['User-Agent'],'Referer':'https://topcinemaa.com/'}
+        r=requests.get(embed_url,headers=h,timeout=15)
+        decoded=decode_eval(r.text)
+        if not decoded: return []
+        mp4s=re.findall(r'https?://[^\s"\'\\,\)]+\.mp4[^\s"\'\\,\)]*',decoded)
+        labels=re.findall(r'label:"([^"]+)"',decoded)
+        return [{'url':u,'label':labels[i] if i<len(labels) else f'جودة {i+1}'} for i,u in enumerate(mp4s)]
+    except: return []
+
+def get_embed_from_watch(url):
+    try:
+        watch_url = url.rstrip('/') + '/watch/'
+        r = requests.get(watch_url, headers=HEADERS, timeout=15)
+        soup = BeautifulSoup(r.text, 'html.parser')
+        for iframe in soup.find_all('iframe'):
+            src = iframe.get('src','') or iframe.get('data-src','')
+            if src and 'vidtube' in src:
+                return src
+        r2 = requests.get(url, headers=HEADERS, timeout=15)
+        soup2 = BeautifulSoup(r2.text, 'html.parser')
+        for iframe in soup2.find_all('iframe'):
+            src = iframe.get('src','') or iframe.get('data-src','')
+            if src and ('vidtube' in src or 'embed' in src.lower()):
+                return src
+    except: pass
+    return None
+
+def get_items(soup):
+    items=[]
+    seen=set()
+    for item in soup.find_all(class_=['Block--Item','Small--Box']):
+        a=item.find('a',href=True)
+        if not a: continue
+        href=a.get('href','')
+        if not href or href in seen: continue
+        seen.add(href)
+        h3=item.find('h3')
+        title=h3.text.strip() if h3 else a.get('title','')
+        img=get_img(item.find('img'))
+        ribbon=item.find(class_='ribbon')
+        quality=ribbon.text.strip() if ribbon else ''
+        genres=[]
+        for li in item.find_all('li'):
+            t=li.text.strip()
+            if t and not any(x in t for x in ['BluRay','WEB','HD','SD','FHD','720','1080','480','240','p ']):
+                genres.append(t)
+        if title:
+            items.append({'href':href,'title':title,'img':img,'quality':quality,'genres':genres[:3]})
+    return items
+
+# proxy لجلب الفيديو وحل مشكلة CORS
+@app.route('/proxy')
+def proxy():
+    video_url = request.args.get('url','')
+    if not video_url:
+        return 'no url', 400
+    try:
+        range_header = request.headers.get('Range','')
+        h = {
+            'User-Agent': HEADERS['User-Agent'],
+            'Referer': 'https://vidtube.one/',
+            'Origin': 'https://vidtube.one',
+        }
+        if range_header:
+            h['Range'] = range_header
+        rv = requests.get(video_url, headers=h, stream=True, timeout=30)
+        def generate():
+            for chunk in rv.iter_content(chunk_size=65536):
+                if chunk:
+                    yield chunk
+        resp_headers = {
+            'Content-Type': rv.headers.get('Content-Type','video/mp4'),
+            'Accept-Ranges': 'bytes',
+            'Access-Control-Allow-Origin': '*',
+        }
+        if 'Content-Length' in rv.headers:
+            resp_headers['Content-Length'] = rv.headers['Content-Length']
+        if 'Content-Range' in rv.headers:
+            resp_headers['Content-Range'] = rv.headers['Content-Range']
+        return Response(generate(), status=rv.status_code, headers=resp_headers)
+    except Exception as e:
+        return str(e), 500
+
+MAIN = r"""<!DOCTYPE html>
+<html dir="rtl" lang="ar">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>توب سينما</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#fff;font-family:Tahoma,Arial,sans-serif}
+::-webkit-scrollbar{width:5px;height:4px}
+::-webkit-scrollbar-thumb{background:#e50914;border-radius:3px}
+.hd{background:#0d0d1a;padding:12px 16px;display:flex;align-items:center;gap:12px;position:sticky;top:0;z-index:999;border-bottom:2px solid #e50914}
+.logo{font-size:20px;font-weight:bold;color:#e50914;white-space:nowrap}
+.logo span{color:#fff}
+.sw{display:flex;flex:1;gap:6px;max-width:400px}
+.sw input{flex:1;padding:9px 14px;background:#1a1a2e;border:1px solid #333;border-radius:22px;color:#fff;font-size:14px;outline:none}
+.sw input:focus{border-color:#e50914}
+.sw button{padding:9px 16px;background:#e50914;border:none;border-radius:22px;color:#fff;cursor:pointer;font-weight:bold}
+.nav{background:#111827;padding:8px 12px;display:flex;gap:6px;overflow-x:auto;border-bottom:1px solid #1f2937}
+.nav::-webkit-scrollbar{height:2px}
+.nav a{color:#9ca3af;padding:7px 14px;border-radius:18px;white-space:nowrap;font-size:13px;cursor:pointer;transition:.2s}
+.nav a:hover,.nav a.act{background:#e50914;color:#fff}
+.cont{padding:16px;max-width:1400px;margin:0 auto}
+.st{font-size:18px;font-weight:bold;margin:20px 0 12px;display:flex;align-items:center;gap:8px}
+.st::before{content:"";width:4px;height:22px;background:#e50914;border-radius:2px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px}
+.card{background:#111827;border-radius:10px;overflow:hidden;cursor:pointer;position:relative;transition:.25s}
+.card:hover{transform:translateY(-4px);box-shadow:0 8px 25px rgba(229,9,20,.4)}
+.card img{width:100%;height:220px;object-fit:cover;display:block;background:#1f2937}
+.cb{padding:8px}
+.ct{font-size:12px;font-weight:bold;line-height:1.4;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.bdg{position:absolute;top:6px;right:6px;background:rgba(229,9,20,.9);color:#fff;font-size:10px;padding:2px 7px;border-radius:8px;font-weight:bold}
+.pov{position:absolute;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;opacity:0;transition:.25s}
+.card:hover .pov{opacity:1}
+.pic{width:54px;height:54px;background:#e50914;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:22px}
+.ld{text-align:center;padding:60px}
+.sp{width:48px;height:48px;border:3px solid #1f2937;border-top:3px solid #e50914;border-radius:50%;animation:sp 1s linear infinite;margin:0 auto 14px}
+@keyframes sp{to{transform:rotate(360deg)}}
+.er{background:#1a0505;border:1px solid #e50914;border-radius:10px;padding:20px;text-align:center;color:#f87171;margin:20px}
+.pg{display:flex;justify-content:center;gap:10px;margin:28px 0}
+.pg span{padding:9px 20px;background:#1f2937;color:#fff;border-radius:10px;cursor:pointer;transition:.2s}
+.pg span:hover{background:#e50914}
+@media(max-width:600px){
+.hd{flex-wrap:wrap}.sw{max-width:100%;order:3;width:100%}
+.grid{grid-template-columns:repeat(auto-fill,minmax(130px,1fr))}
+.card img{height:185px}}
+</style>
+</head>
+<body>
+<div class="hd">
+  <div class="logo">🎬 <span>توب سينما</span></div>
+  <div class="sw">
+    <input id="sq" type="text" placeholder="ابحث..." onkeypress="if(event.key==='Enter')doSearch()">
+    <button onclick="doSearch()">🔍</button>
+  </div>
+</div>
+<nav class="nav">
+  <a class="act" onclick="goHome(this)">🏠 الرئيسية</a>
+  <a onclick="goBrowse(this,'https://topcinemaa.com/movies/')">🎬 أفلام</a>
+  <a onclick="goBrowse(this,'https://topcinemaa.com/recent/')">🆕 حديثاً</a>
+  <a onclick="goBrowse(this,'https://topcinemaa.com/category/%d8%a7%d9%81%d9%84%d8%a7%d9%85-%d8%a7%d8%ac%d9%86%d8%a8%d9%8a-8/')">🌍 أجنبي</a>
+  <a onclick="goBrowse(this,'https://topcinemaa.com/category/%d8%a7%d9%81%d9%84%d8%a7%d9%85-%d8%a7%d9%86%d9%85%d9%8a-2/')">🎌 أنمي</a>
+  <a onclick="goBrowse(this,'https://topcinemaa.com/netflix-movies/')">📺 نتفليكس</a>
+  <a onclick="goBrowse(this,'https://topcinemaa.com/top-rating-imdb/')">⭐ الأعلى</a>
+  <a onclick="goBrowse(this,'https://topcinemaa.com/category/%d9%85%d8%b3%d9%84%d8%b3%d9%84%d8%a7%d8%aa-%d8%a7%d8%ac%d9%86%d8%a8%d9%8a/')">📽 مسلسلات</a>
+  <a onclick="goBrowse(this,'https://topcinemaa.com/full-packs/')">📦 باقات</a>
+  <a onclick="goBrowse(this,'https://topcinemaa.com/top-rating-imdb-series/')">⭐ أعلى مسلسلات</a>
+</nav>
+<div id="root"><div class="ld"><div class="sp"></div><p>جاري التحميل...</p></div></div>
+<script>
+const FB='https://topcinemaa.com/wp-content/themes/movies2023/cover.jpg';
+const root=document.getElementById('root');
+function act(el){document.querySelectorAll('.nav a').forEach(a=>a.classList.remove('act'));if(el)el.classList.add('act');}
+function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function mkCard(item){
+  return '<div class="card" onclick="location.href=\'/watch?url=\'+encodeURIComponent(\''+item.href+'\')">'
+    +'<img src="'+(item.img||FB)+'" loading="lazy" onerror="this.src=\''+FB+'\'">'
+    +(item.quality?'<div class="bdg">'+esc(item.quality)+'</div>':'')
+    +'<div class="pov"><div class="pic">&#9654;</div></div>'
+    +'<div class="cb"><div class="ct">'+esc(item.title)+'</div></div></div>';
+}
+function goHome(el){act(el);loadHome();}
+function goBrowse(el,url){act(el);loadBrowse(url);}
+function doSearch(){
+  const q=document.getElementById('sq').value.trim();
+  if(!q)return;act(null);
+  loadBrowse('https://topcinemaa.com/?s='+encodeURIComponent(q));
+}
+function loadHome(){
+  root.innerHTML='<div class="ld"><div class="sp"></div><p>جاري التحميل...</p></div>';
+  fetch('/api/home').then(r=>r.json()).then(data=>{
+    if(!data.sections||!data.sections.length){
+      root.innerHTML='<div class="er">خطأ: '+(data.error||'لا بيانات')+'</div>';return;
+    }
+    let h='<div class="cont">';
+    data.sections.forEach(s=>{
+      h+='<div class="st">'+esc(s.title)+'</div><div class="grid">';
+      s.items.forEach(i=>{h+=mkCard(i);});
+      h+='</div>';
+    });
+    root.innerHTML=h+'</div>';
+  }).catch(e=>{root.innerHTML='<div class="er">خطأ: '+e+'</div>';});
+}
+function loadBrowse(url){
+  root.innerHTML='<div class="ld"><div class="sp"></div><p>جاري التحميل...</p></div>';
+  fetch('/api/browse?url='+encodeURIComponent(url)).then(r=>r.json()).then(data=>{
+    if(!data.items||!data.items.length){root.innerHTML='<div class="er">لا توجد نتائج</div>';return;}
+    let h='<div class="cont"><div class="grid">';
+    data.items.forEach(i=>{h+=mkCard(i);});
+    h+='</div>';
+    if(data.next_page){h+='<div class="pg"><span onclick="loadBrowse(\''+encodeURIComponent(data.next_page)+'\')">التالي ›</span></div>';}
+    root.innerHTML=h+'</div>';
+  }).catch(e=>{root.innerHTML='<div class="er">خطأ: '+e+'</div>';});
+}
+loadHome();
+</script>
+</body></html>"""
+
+WATCH = r"""<!DOCTYPE html>
+<html dir="rtl" lang="ar">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>مشاهدة - توب سينما</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#fff;font-family:Tahoma,Arial,sans-serif}
+.hd{background:#0d0d1a;padding:12px 16px;display:flex;align-items:center;gap:10px;border-bottom:2px solid #e50914}
+.btn{padding:8px 14px;background:#e50914;border:none;color:#fff;border-radius:18px;cursor:pointer;font-size:13px;text-decoration:none;display:inline-block}
+.logo{font-size:18px;font-weight:bold;color:#e50914;margin-right:auto}
+.wrap{max-width:900px;margin:0 auto;padding:14px}
+.pbox{background:#000;border-radius:12px;overflow:hidden;aspect-ratio:16/9;position:relative}
+.pbox video{width:100%;height:100%;display:block}
+.title{font-size:18px;font-weight:bold;margin:14px 0 8px}
+.qb{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 16px}
+.qbtn{padding:7px 18px;background:#1f2937;border:2px solid #374151;border-radius:18px;color:#fff;cursor:pointer;font-size:13px;transition:.2s}
+.qbtn:hover,.qbtn.on{background:#e50914;border-color:#e50914}
+.st{font-size:16px;font-weight:bold;margin:20px 0 10px;display:flex;align-items:center;gap:6px}
+.st::before{content:"";width:3px;height:18px;background:#e50914;border-radius:2px}
+.epg{display:grid;grid-template-columns:repeat(auto-fill,minmax(72px,1fr));gap:6px;margin-bottom:16px}
+.ep{padding:9px 4px;background:#1f2937;border:1px solid #374151;border-radius:8px;color:#fff;cursor:pointer;text-align:center;font-size:11px;transition:.2s}
+.ep:hover,.ep.on{background:#e50914;border-color:#e50914}
+.rg{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:10px;margin-bottom:24px}
+.rc{background:#111827;border-radius:8px;overflow:hidden;cursor:pointer;transition:.2s}
+.rc:hover{transform:scale(1.03)}
+.rc img{width:100%;height:170px;object-fit:cover;background:#1f2937}
+.rc p{padding:7px;font-size:11px;line-height:1.4}
+.ld{text-align:center;padding:50px}
+.sp{width:44px;height:44px;border:3px solid #1f2937;border-top:3px solid #e50914;border-radius:50%;animation:sp 1s linear infinite;margin:0 auto 14px}
+@keyframes sp{to{transform:rotate(360deg)}}
+.er{background:#1a0505;border:1px solid #e50914;border-radius:10px;padding:20px;text-align:center;color:#f87171;margin:20px}
+</style>
+</head>
+<body>
+<div class="hd">
+  <a href="/" class="btn">🏠 الرئيسية</a>
+  <a href="javascript:history.back()" class="btn">← رجوع</a>
+  <div class="logo">🎬 توب سينما</div>
+</div>
+<div class="wrap">
+  <div id="pa"><div class="ld"><div class="sp"></div><p>جاري تحميل الفيديو...</p></div></div>
+</div>
+<script>
+const FB='https://topcinemaa.com/wp-content/themes/movies2023/cover.jpg';
+const PU=decodeURIComponent(location.search.replace('?url=',''));
+function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+
+// تحويل رابط الفيديو عبر proxy محلي
+function proxyUrl(url){
+  return '/proxy?url='+encodeURIComponent(url);
+}
+
+fetch('/api/getlinks?url='+encodeURIComponent(PU))
+.then(r=>r.json())
+.then(data=>{
+  const pa=document.getElementById('pa');
+  if(data.title) document.title=data.title+' - توب سينما';
+  let h='';
+  if(data.title) h+='<div class="title">'+esc(data.title)+'</div>';
+
+  if(!data.links||!data.links.length){
+    h+='<div class="er">❌ '+(data.error||'لم يتم العثور على روابط الفيديو')+'</div>';
+  } else {
+    // اختر 720p افتراضياً
+    let defIdx=0;
+    data.links.forEach((lk,i)=>{if(lk.label.includes('720'))defIdx=i;});
+
+    h+='<div class="qb">';
+    data.links.forEach((lk,i)=>{
+      h+='<button class="qbtn'+(i===defIdx?' on':'')+'" data-url="'+esc(lk.url)+'" onclick="chQ(this)">'+esc(lk.label)+'</button>';
+    });
+    h+='</div>';
+
+    // استخدام proxy لتشغيل الفيديو
+    const defUrl = proxyUrl(data.links[defIdx].url);
+    h+='<div class="pbox">'
+      +'<video id="vid" controls autoplay preload="auto" src="'+esc(defUrl)+'">'
+      +'<source src="'+esc(defUrl)+'" type="video/mp4">'
+      +'</video></div>';
+  }
+
+  // الحلقات
+  if(data.episodes&&data.episodes.length){
+    h+='<div class="st">📋 الحلقات ('+data.episodes.length+')</div><div class="epg">';
+    data.episodes.forEach((ep,i)=>{
+      const isCurrent = PU.includes(ep.href) || ep.href.includes(PU);
+      h+='<div class="ep'+(isCurrent?' on':'')+'" onclick="goEp(\''+ep.href+'\')">'+esc(ep.title||'ح '+(i+1))+'</div>';
+    });
+    h+='</div>';
+  }
+
+  // المشابهة
+  if(data.related&&data.related.length){
+    h+='<div class="st">🎬 قد يعجبك</div><div class="rg">';
+    data.related.forEach(item=>{
+      h+='<div class="rc" onclick="location.href=\'/watch?url=\'+encodeURIComponent(\''+item.href+'\')">'
+        +'<img src="'+(item.img||FB)+'" loading="lazy" onerror="this.src=\''+FB+'\'">'
+        +'<p>'+esc(item.title)+'</p></div>';
+    });
+    h+='</div>';
+  }
+
+  pa.innerHTML=h;
+})
+.catch(e=>{
+  document.getElementById('pa').innerHTML='<div class="er">❌ '+e+'</div>';
+});
+
+function chQ(btn){
+  document.querySelectorAll('.qbtn').forEach(b=>b.classList.remove('on'));
+  btn.classList.add('on');
+  const v=document.getElementById('vid');
+  if(v){
+    const t=v.currentTime;
+    v.src='/proxy?url='+encodeURIComponent(btn.dataset.url);
+    v.currentTime=t;
+    v.play().catch(()=>{});
+  }
+}
+
+function goEp(href){
+  location.href='/watch?url='+encodeURIComponent(href);
+}
+</script>
+</body></html>"""
+
+@app.route('/')
+def index():
+    return MAIN
+
+@app.route('/watch')
+def watch():
+    return WATCH
+
+@app.route('/api/home')
+def api_home():
+    try:
+        r=requests.get('https://topcinemaa.com/',headers=HEADERS,timeout=15)
+        soup=BeautifulSoup(r.text,'html.parser')
+        sections=[]
+        si=[]
+        for item in soup.find_all(class_='Block--Item')[:12]:
+            a=item.find('a',href=True)
+            if not a: continue
+            img=get_img(item.find('img'))
+            ribbon=item.find(class_='ribbon')
+            si.append({'href':a['href'],'title':a.get('title',''),'img':img,'quality':ribbon.text.strip() if ribbon else '','genres':[]})
+        if si: sections.append({'title':'🔥 أبرز الأفلام','items':si})
+        for ob in soup.find_all(class_='OneBox'):
+            tb=ob.find(class_='Title--Box')
+            sec='قسم'
+            if tb:
+                h3=tb.find('h3')
+                if h3: sec=h3.text.strip()
+            items=[]
+            seen=set()
+            for item in ob.find_all(class_='Small--Box'):
+                a=item.find('a',href=True)
+                if not a or a['href'] in seen: continue
+                seen.add(a['href'])
+                h3=item.find('h3',class_='title') or item.find('h3')
+                title=h3.text.strip() if h3 else a.get('title','')
+                img=get_img(item.find('img'))
+                genres=[]
+                for li in item.find_all('li'):
+                    t=li.text.strip()
+                    if t and not any(x in t for x in ['BluRay','WEB','HD','SD','FHD','720','1080','480','240','p ']):
+                        genres.append(t)
+                if title:
+                    items.append({'href':a['href'],'title':title,'img':img,'quality':'','genres':genres[:2]})
+            if items: sections.append({'title':sec,'items':items})
+        return jsonify({'sections':sections})
+    except Exception as e:
+        return jsonify({'sections':[],'error':str(e)})
+
+@app.route('/api/browse')
+def api_browse():
+    url=request.args.get('url','https://topcinemaa.com/')
+    try:
+        r=requests.get(url,headers=HEADERS,timeout=15)
+        soup=BeautifulSoup(r.text,'html.parser')
+        items=get_items(soup)
+        next_page=None
+        for a in soup.find_all('a',href=True):
+            if ('التالي' in a.text or 'next' in a.text.lower()) and 'topcinemaa' in a['href']:
+                next_page=a['href']
+                break
+        return jsonify({'items':items,'next_page':next_page})
+    except Exception as e:
+        return jsonify({'items':[],'error':str(e)})
+
+@app.route('/api/getlinks')
+def api_getlinks():
+    url=request.args.get('url','')
+    if not url: return jsonify({'error':'لا يوجد رابط'})
+    try:
+        r=requests.get(url,headers=HEADERS,timeout=15)
+        soup=BeautifulSoup(r.text,'html.parser')
+        title=''
+        h1=soup.find('h1',class_='post-title') or soup.find(class_='post-title')
+        if h1: title=h1.text.strip()
+        if not title and soup.title: title=soup.title.string or ''
+        episodes=[]
+        ep=soup.find(class_='allepcont')
+        if ep:
+            for a in ep.find_all('a',href=True)[:60]:
+                t=a.text.strip() or a.get('title','')
+                if t: episodes.append({'href':a['href'],'title':t})
+        related=[]
+        seen_r=set()
+        for item in soup.find_all(class_='Small--Box')[:10]:
+            a=item.find('a',href=True)
+            if not a or a['href'] in seen_r: continue
+            seen_r.add(a['href'])
+            h3=item.find('h3')
+            t=h3.text.strip() if h3 else a.get('title','')
+            if t: related.append({'href':a['href'],'title':t,'img':get_img(item.find('img'))})
+        embed_url=get_embed_from_watch(url)
+        links=get_video_links(embed_url) if embed_url else []
+        return jsonify({'links':links,'title':title,'related':related,'episodes':episodes,'embed_url':embed_url or ''})
+    except Exception as e:
+        return jsonify({'error':str(e),'links':[]})
+
+if __name__=='__main__':
+    import socket
+    try:
+        s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8',80))
+        ip=s.getsockname()[0]
+        s.close()
+    except: ip='localhost'
+    print('='*40)
+    print('🎬 توب سينما يعمل!')
+    print(f'🌐 http://localhost:5000')
+    print(f'📱 http://{ip}:5000')
+    print('='*40)
+    app.run(host='0.0.0.0',port=5000,debug=False,threaded=True)
+EOF
